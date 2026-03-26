@@ -10,7 +10,7 @@ import matplotlib
 from mpl_toolkits.axes_grid1.inset_locator import inset_axes
 
 
-def plot_samples(samples, ground_truth, model_names=['Samples'], contrast_cutoff=99):
+def plot_samples(samples, ground_truth, model_names=['Samples'], contrast_cutoff=99, num_images=8, save_dir=None):
     """
     Plot ground truth data and samples from model(s).
     
@@ -24,6 +24,10 @@ def plot_samples(samples, ground_truth, model_names=['Samples'], contrast_cutoff
         List of names corresponding to each model.
     contrast_cutoff : int, optional
         Percentile to determine contrast cutoff for display. Defaults to 99.
+    num_images : int, optional
+        Number of images to display for each model and ground truth.
+    save_dir : str, optional
+        Directory to save the plot.
     """
 
     vmin, vmax = np.percentile(ground_truth.flatten()[:5000], 100 - contrast_cutoff), np.percentile(ground_truth.flatten()[:5000], contrast_cutoff)
@@ -31,7 +35,7 @@ def plot_samples(samples, ground_truth, model_names=['Samples'], contrast_cutoff
     if type(samples) is not list:
         samples = [samples]
 
-    fig, axs = plt.subplots(len(samples) + 1, 8, figsize=(20, 2*(len(samples)+1)))
+    fig, axs = plt.subplots(len(samples) + 1, num_images, figsize=(2.5*num_images, 2*(len(samples)+1)))
     
     for row_index, model_samples in enumerate(samples):
         for i, ax in enumerate(axs[row_index]):
@@ -46,6 +50,8 @@ def plot_samples(samples, ground_truth, model_names=['Samples'], contrast_cutoff
     # set y labels to left of each row by adding new axes
     for i, (ax, name) in enumerate(zip(axs[:, 0], model_names + ['Ground Truth'])):
         ax.text(-0.1, 0.5, name,  transform=ax.transAxes, rotation=90, va='center', ha='center')
+    if save_dir is not None:
+        plt.savefig(save_dir + 'samples.png', bbox_inches='tight')
 
 def plot_optimization_loss_history(val_loss_history):
     """
