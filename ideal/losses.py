@@ -153,7 +153,7 @@ class MultichannelPixelCNNLoss(BaseLoss):
 class PixelCNNLoss(BaseLoss):
     """Loss using PixelCNN model for entropy estimation."""
     
-    def __init__(self, refit_every: Optional[int] = None, refit_patience: Optional[int] = 10, refit_learning_rate: Optional[float] = 1e-3, refit_steps_per_epoch: Optional[int] = 100, reinitialize_pixelcnn: Optional[bool] = True):
+    def __init__(self, refit_every: Optional[int] = None, refit_patience: Optional[int] = 10, refit_learning_rate: Optional[float] = 1e-3, refit_steps_per_epoch: Optional[int] = 100, reinitialize_pixelcnn: Optional[bool] = True, use_clean_images: Optional[bool] = False):
 
         """Initialize PixelCNNLoss.
         
@@ -172,6 +172,7 @@ class PixelCNNLoss(BaseLoss):
         self.refit_learning_rate = refit_learning_rate
         self.refit_steps_per_epoch = refit_steps_per_epoch
         self.reinitialize_pixelcnn = reinitialize_pixelcnn
+        self.use_clean_images = use_clean_images
         self.step_counter = 0
         self._is_initialized = False
 
@@ -212,7 +213,10 @@ class PixelCNNLoss(BaseLoss):
             pixel_cnn._state.params, 
             noisy_patches.reshape(-1, patch_size, patch_size)[..., None]
         )
-        h_y_given_x = estimate_conditional_entropy(noisy_patches, gaussian_noise_sigma=gaussian_sigma)
+        if self.use_clean_images:
+            h_y_given_x = estimate_conditional_entropy(patches, gaussian_noise_sigma=gaussian_sigma)
+        else:
+            h_y_given_x = estimate_conditional_entropy(noisy_patches, gaussian_noise_sigma=gaussian_sigma)
         mi = (h_y - h_y_given_x) / jnp.log(2)
         return -mi
     
