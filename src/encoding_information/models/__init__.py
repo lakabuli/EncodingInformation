@@ -2,4 +2,4 @@ from .pixel_cnn import PixelCNN
 from .multichannel_pixel_cnn import MultiChannelPixelCNN
 from .gaussian_process import FullGaussianProcess, StationaryGaussianProcess
 
-from .conditional_entropy_models import AnalyticGaussianNoiseModel, PoissonNoiseModel, AnalyticComplexPixelGaussianNoiseModel
+from .conditional_entropy_models import AnalyticGaussianNoiseModel, PoissonNoiseModel, AnalyticComplexPixelGaussianNoiseModel, UniformNoiseModel

@@ -7,7 +7,7 @@ from .model_base_class import MeasurementNoiseModel
 
 class AnalyticGaussianNoiseModel(MeasurementNoiseModel):
     """
-    Analytical model for estimating the conditional entropy H(Y | X) when the noise proces
+    Analytical model for estimating the conditional entropy H(Y | X) when the noise process
     is additive independent Gaussian noise at each pixel.
     """
     
@@ -40,7 +40,45 @@ class AnalyticGaussianNoiseModel(MeasurementNoiseModel):
         if images is not None:
             warnings.warn("The images argument is not used in the Analytic Gaussian noise model.")
         # Conditional entropy H(Y | X) for Gaussian noise
-        return 0.5 * np.log(2 * np.pi * np.e * self.sigma**2)
+        return 0.5 * np.log(2 * np.pi * np.e * self.sigma**2)  
+
+class UniformNoiseModel(MeasurementNoiseModel):
+    """ 
+    Model for estimating the conditional entropy H(Y | X) when the noise process is Uniform noise.
+    """
+
+    def __init__(self, min_value=0, max_value=1):
+        """ 
+        Initialize the UniformNoiseModel.
+
+        Parameters
+        ----------
+        min_value : float, optional
+            Minimum value of the uniform distribution (default is 0).
+        max_value : float, optional
+            Maximum value of the uniform distribution (default is 1).
+        """
+        self.range = max_value - min_value
+    
+    def estimate_conditional_entropy(self, images=None):
+        """
+        Compute the conditional entropy H(Y | X) for uniform noise.
+
+        Parameters
+        ----------
+        images : jax.Array, optional
+            Unused in this model. The parameter is kept for compatibility.
+
+        Returns
+        -------
+        float
+            The computed conditional entropy, given by the formula:
+            log(range).
+        """
+        if images is not None:
+            warnings.warn("The images argument is not used in the Uniform noise model.")
+        # Conditional entropy H(Y | X) for uniform noise
+        return np.log(self.range)
 
 class PoissonNoiseModel(MeasurementNoiseModel):
     """
@@ -74,8 +112,8 @@ class PoissonNoiseModel(MeasurementNoiseModel):
 
 class AnalyticComplexPixelGaussianNoiseModel(MeasurementNoiseModel):
     """
-    Analytical model for estimating the conditional entropy H(Y | X) with complex-valued pixels when the noise process is additive independent Gaussian noise at each pixel 
-    with different standard deviation at each pixel.
+    Analytical model for estimating the total conditional entropy H(Y | X) with complex-valued pixels when the noise process is additive
+    independent Gaussian noise with different standard deviation at each complex-valued pixel.
     """
 
     def __init__(self, sigma_vec):
@@ -87,7 +125,6 @@ class AnalyticComplexPixelGaussianNoiseModel(MeasurementNoiseModel):
     def estimate_conditional_entropy(self, images=None):
         # input vector here if it's complex-valued items will be half the length of the vector used in the other computations. this has the number of complex-valued pixels. 
         # D log2 2 pi e + 2 sum log_2 sigma_i -> instead, computing here in log space because final MI computation will convert it to log2
-        # returning total conditional entropy here
         constant_term = self.sigma_vec.shape[0] * np.log(2 * np.pi * np.exp(1))
         sum_log_sigmas = 2 * np.sum(np.log(self.sigma_vec))
         return constant_term + sum_log_sigmas
