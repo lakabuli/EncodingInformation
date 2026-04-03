@@ -9,18 +9,27 @@ class AnalyticGaussianNoiseModel(MeasurementNoiseModel):
     """
     Analytical model for estimating the conditional entropy H(Y | X) when the noise process
     is additive independent Gaussian noise at each pixel.
+
+    For multichannel data, the conditional entropy is per spatial pixel (summed over channels), matching the 
+    MultiChannelPixelCNN NLL convention.
     """
     
-    def __init__(self, sigma):
+    def __init__(self, sigma, num_channels=1):
         """
         Initialize the AnalyticGaussianNoiseModel.
 
         Parameters
         ----------
         sigma : float
-            Standard deviation of the Gaussian noise.
+            Standard deviation of the Gaussian noise (same for all channels).
+        num_channels : int, optional
+            Number of image channels C (default is 1).  Scales the result by C.
         """
+        if not np.isscalar(sigma):
+            raise ValueError("Per-channel sigma arrays are not yet supported. "
+                             "sigma must be a single scalar value.")
         self.sigma = sigma
+        self.num_channels = num_channels
 
     def estimate_conditional_entropy(self, images=None):
         """
@@ -40,7 +49,7 @@ class AnalyticGaussianNoiseModel(MeasurementNoiseModel):
         if images is not None:
             warnings.warn("The images argument is not used in the Analytic Gaussian noise model.")
         # Conditional entropy H(Y | X) for Gaussian noise
-        return 0.5 * np.log(2 * np.pi * np.e * self.sigma**2)  
+        return self.num_channels * 0.5 * np.log(2 * np.pi * np.e * self.sigma**2)
 
 class UniformNoiseModel(MeasurementNoiseModel):
     """ 
@@ -97,11 +106,15 @@ class PoissonNoiseModel(MeasurementNoiseModel):
         Returns
         -------
         float
-            The average conditional entropy per pixel, computed using a Gaussian approximation.
+            The average conditional entropy per spatial pixel, computed using a Gaussian approximation. 
+            For multichannel data (B, H, W, C) the per-channel contributions are summed so the result matches the
+            MultiChannelPixelCNN NLL convention (per spatial pixel).
         """
-        # do the actual computation here
-        images = images.reshape(-1, images.shape[-2] * images.shape[-1])
-        n_pixels = images.shape[-1]
+        if len(images.shape) == 4:
+            n_pixels = images.shape[-2] * images.shape[-3] # number of spatial pixels
+        else:
+            n_pixels = images.shape[-1] * images.shape[-2]
+        images = images.reshape(images.shape[0], -1) # flatten spatial (and channel) dimensions
         
         # Conditional entropy H(Y | x) for Poisson noise
         gaussian_approx = 0.5 * (np.log(2 * np.pi * np.e) + np.log(images))
