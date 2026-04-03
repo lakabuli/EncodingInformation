@@ -9,7 +9,7 @@ https://github.com/hardmaru/mdn_jax_tutorial/blob/master/mixture_density_network
 ## Standard libraries
 import os
 import numpy as onp
-from typing import Any
+from typing import Any, Optional
 from tqdm import tqdm
 import warnings
 
@@ -18,6 +18,7 @@ import jax
 import jax.numpy as np
 from jax import random
 from jax.scipy.special import logsumexp 
+from jax.scipy.linalg import solve_triangular
 
 from flax import linen as nn
 from flax.training.train_state import TrainState
@@ -36,15 +37,16 @@ class PreprocessLayer(nn.Module):
     Attributes
     ----------
     mean : np.ndarray
-        The mean to subtract from the input images.
+        Per-channel mean to subtract, shape ``(C,)``, dtype ``float32`` (broadcast over
+        batch and spatial dimensions of ``(N, H, W, C)`` inputs).
     std : np.ndarray
-        The standard deviation to divide the input images by.
+        Per-channel standard deviation to divide by, shape ``(C,)``, dtype ``float32``.
     """
     mean: np.ndarray
     std: np.ndarray
 
     def __call__(self, x):
-        return (x - self.mean) / (self.std + 1e-5) # this might need much smaller values if input data is on a small scale
+        return (x - self.mean) / (self.std + 1e-5)
 
 class MaskedConvolution(nn.Module):
     """
@@ -238,9 +240,9 @@ class GatedMaskedConv(nn.Module):
 
 class _MultiChannelPixelCNNFlaxImpl(nn.Module):
     """
-    The core implementation of the PixelCNN model in Flax.
+    The core implementation of the MultiChannelPixelCNN model in Flax.
 
-    This module defines the structure of the PixelCNN, including the vertical and horizontal
+    This module defines the structure of the MultiChannelPixelCNN, including the vertical and horizontal
     masked convolutions, gated activation functions, and a mixture density output layer.
 
     Attributes
@@ -251,14 +253,14 @@ class _MultiChannelPixelCNNFlaxImpl(nn.Module):
         The number of hidden channels in the model (default is 64).
     num_mixture_components : int, optional
         The number of components in the mixture density output (default is 40).
-    train_data_mean : float 
-        The mean of the training data used for normalization. Multichannel considers a float for each channel.
-    train_data_std : float
-        The standard deviation of the training data used for normalization. Multichannel considers a float for each channel.
-    train_data_min : float
-        The minimum value of the training data. Multichannel considers a float for each channel.
-    train_data_max : float
-        The maximum value of the training data. Multichannel considers a float for each channel.
+    train_data_mean : np.ndarray
+        Per-channel float32 mean of the training data used for normalization.
+    train_data_std : np.ndarray
+        Per-channel float32 standard deviation for normalization.
+    train_data_min : np.ndarray
+        Per-channel float32 minimum of the training data (used to clip mixture means).
+    train_data_max : np.ndarray
+        Per-channel float32 maximum of the training data.
     sigma_min : float, optional
         The minimum standard deviation for the mixture density output (default is 1).
     condition_vector_size : int, optional
@@ -269,10 +271,10 @@ class _MultiChannelPixelCNNFlaxImpl(nn.Module):
     data_shape : tuple
     num_hidden_channels : int = 64
     num_mixture_components : int = 40
-    train_data_mean : float = None
-    train_data_std : float = None
-    train_data_min : float = None 
-    train_data_max : float = None
+    train_data_mean: Optional[np.ndarray] = None
+    train_data_std: Optional[np.ndarray] = None
+    train_data_min: Optional[np.ndarray] = None
+    train_data_max: Optional[np.ndarray] = None
     sigma_min : float = 1
     condition_vector_size : int = None
     use_positional_embedding : bool = False
@@ -284,8 +286,8 @@ class _MultiChannelPixelCNNFlaxImpl(nn.Module):
         if self.train_data_max.dtype != np.float32 or self.train_data_min.dtype != np.float32 or \
             self.train_data_mean.dtype != np.float32 or self.train_data_std.dtype != np.float32:
             raise Exception('Must pass in training data statistics as float32')
-        
-        self.normalize = PreprocessLayer(mean=self.train_data_mean, std=self.train_data_std) 
+
+        self.normalize = PreprocessLayer(mean=self.train_data_mean, std=self.train_data_std)
 
         if not isinstance(self.num_hidden_channels, int):
             raise ValueError("num_hidden_channels must be an integer")
@@ -304,7 +306,7 @@ class _MultiChannelPixelCNNFlaxImpl(nn.Module):
         ]
         # Output classification convolution (1x1)
         self.conv_out = nn.Conv(self.num_hidden_channels, kernel_size=(1, 1))
-        
+
         # parameters for mixture density 
         def my_bias_init(rng, shape, dtype):
             return random.uniform(rng, shape, dtype=dtype,
@@ -317,8 +319,8 @@ class _MultiChannelPixelCNNFlaxImpl(nn.Module):
             self.position_indices = np.arange(self.data_shape[0] * self.data_shape[1]).reshape(*self.data_shape[:2])
 
         self.mu_dense = nn.Dense(self.num_mixture_components * self.data_shape[2], bias_init=my_bias_init) # scale by number of channels
-        self.sigma_dense = nn.Dense(self.num_mixture_components * self.data_shape[2] * self.data_shape[2]) # scale by squared number of channels since matrix
-        self.mix_logit_dense = nn.Dense(self.num_mixture_components) # mixture components are scalars for each pixel
+        self.sigma_dense = nn.Dense(self.num_mixture_components * self.data_shape[2] * self.data_shape[2]) # matrix, scale by number of channels squared
+        self.mix_logit_dense = nn.Dense(self.num_mixture_components) # per-pixel mixture components are scalars
 
     def __call__(self, x, condition_vectors=None):
         """
@@ -330,39 +332,58 @@ class _MultiChannelPixelCNNFlaxImpl(nn.Module):
 
         return self.forward_pass(x, condition_vectors=condition_vectors)
     
-    def compute_gaussian_nll(self, mu, sigma, mix_logit, x):
+    def compute_gaussian_nll(self, mu, cholesky_l, mix_logit, x):
         # numerically efficient implementation of mixture density, slightly modified
         # see https://github.com/hardmaru/mdn_jax_tutorial/blob/master/mixture_density_networks_jax.ipynb
         # compute per-pixel negative log-likelihood
 
-        # one-by-one step version for debugging. 
-        # lognormal = self.lognormal(x, mu, sigma) 
-        # jax.debug.print("Number of nans in lognormal {test}", test=np.sum(np.isnan(lognormal)))
-        # logit_normalized = mix_logit - logsumexp(mix_logit, axis=-1, keepdims=True) 
-        # jax.debug.print("Number of nans in logit_normalized {test}", test=np.sum(np.isnan(logit_normalized)))
-        # nll = - logsumexp(logit_normalized + lognormal, axis=-1)
+        # previous implementation used covariance matrix sigma
+        # nll = - logsumexp(mix_logit - logsumexp(mix_logit, axis=-1, keepdims=True) + self.lognormal(x, mu, sigma), axis=-1)
 
-        #all in one step 
-        nll = - logsumexp(mix_logit - logsumexp(mix_logit, axis=-1, keepdims=True) + self.lognormal(x, mu, sigma), axis=-1)
+        # current implementation uses cholesky decomposition L
+        logn = self.lognormal(x, mu, cholesky_l)
+        mix_norm = mix_logit - logsumexp(mix_logit, axis=-1, keepdims=True) 
+        inner = mix_norm + logn 
+        nll = -logsumexp(inner, axis=-1)
         return nll
 
-    def compute_loss(self, mu, sigma, mix_logit, x):
+    def compute_loss(self, mu, cholesky_l, mix_logit, x):
         """ 
         Compute average negative log likelihood per pixel averaged over batch and pixels
         """
-        return self.compute_gaussian_nll(mu, sigma, mix_logit, x).mean()
+        return self.compute_gaussian_nll(mu, cholesky_l, mix_logit, x).mean()
 
+    def lognormal(self, y, mean, cholesky_l):
+        """
+        Gaussian log-density per mixture component.
+        log p(x) = -d/2 log(2π) - 1/2 log|Σ| - 1/2 (x-μ)ᵀ Σ⁻¹ (x-μ)
 
-    def lognormal(self, y, mean, sigma):
+        Assumes cholesky_l is lower-triangular and the covariance is Σ = L Lᵀ.
+        Then det(Σ) = det(L)² = (∏ᵢ Lᵢᵢ)² and log|Σ| = 2 ∑ᵢ log(Lᵢᵢ).
+        The Mahalanobis term uses z = L⁻¹ (y-μ) via solve_triangular(L, ...) so Σ⁻¹ is never formed.
+        """
+        d = self.data_shape[2]
         # expand the data in the n_components dimension and tile
         y = np.expand_dims(y, axis=-2)
         y = np.tile(y, (1, 1, 1, self.num_mixture_components, 1))
-        logRootDTwoPI = np.log(2.0 * np.pi) * self.data_shape[2] / 2.0 # d / 2 log 2pi
-        covarianceDeterminant = np.linalg.det(sigma) 
-        matrix_sum = np.einsum('...i, ...ij, ...j->...', y - mean, np.linalg.inv(sigma), y - mean) 
-        # -d/2 log(2pi) - 1/2 log det covariance - 0.5 (x - mu)T covaraince^-1 (x - mu)
-        return -1.0 * logRootDTwoPI - 0.5 * np.log(covarianceDeterminant) - 0.5 * matrix_sum
-        #return -0.5 * ((y - mean) / sigma) ** 2 - np.log(sigma) - logSqrtTwoPI # previous version for 1D
+
+        # explicit calculation from sigma matrix (previous)
+        # logRootDTwoPI = np.log(2.0 * np.pi) * d / 2.0  # d/2 log 2pi 
+        # covarianceDeterminant = np.linalg.det(sigma)
+        # matrix_sum = np.einsum('...i, ...ij, ...j->...', y - mean, np.linalg.inv(sigma), y - mean) 
+        # # -d/2 log(2pi) - 1/2 log det covariance - 0.5 (x - mu)T covaraince^-1 (x - mu)
+        # return -1.0 * logRootDTwoPI - 0.5 * np.log(covarianceDeterminant) - 0.5 * matrix_sum
+
+        half_d_log_two_pi = np.log(2.0 * np.pi) * d / 2.0
+        # log|Σ| from L only (Σ = L Lᵀ): log|Σ| = 2 ∑ᵢ log(Lᵢᵢ); batched over (... , d, d)
+        diag_l = np.diagonal(cholesky_l, axis1=-2, axis2=-1)
+        log_det_cov = 2.0 * np.sum(np.log(diag_l), axis=-1)
+        # avoid inversion: (y - mu)ᵀ Σ⁻¹ (y - mu) = ||L⁻¹ (y - mu)||² = ||z||² where z = L⁻¹ (y - mu) 
+        r = y - mean 
+        z = solve_triangular(cholesky_l, r, lower=True)
+        matrix_sum = np.sum(z * z, axis=-1) 
+        out = -1.0 * half_d_log_two_pi - 0.5 * log_det_cov - 0.5 * matrix_sum
+        return out
 
     def forward_pass(self, x, condition_vectors=None):
         """
@@ -383,8 +404,8 @@ class _MultiChannelPixelCNNFlaxImpl(nn.Module):
         -------
         mu : ndarray
             The mean of the Gaussian components for each pixel.
-        sigma : ndarray
-            The standard deviation of the Gaussian components for each pixel.
+        cholesky_l : ndarray
+            Lower-triangular factor L (per mixture component) with Σ = L Lᵀ in the density (avoids inversion and regularization).
         mix_logit : ndarray
             The logits for the mixture components.
         """
@@ -409,48 +430,52 @@ class _MultiChannelPixelCNNFlaxImpl(nn.Module):
             indices = self.position_indices            
             # apply positional embedding
             out = out + self.positional_embedding(indices)
-        # must be positive and within data range
-        #mu = np.clip(self.mu_dense(out), self.train_data_min, self.train_data_max) # 1D version
-        # mu items need to be reshaped and clipped 
+
+        # mus must be positive and within data range
         mu_out = self.mu_dense(out)
         mu_out = np.reshape(mu_out, (out.shape[0], out.shape[1], out.shape[2], self.num_mixture_components, self.data_shape[2])) # reshape from b x h x w x components*num_channels to b x h x w x components x num_channels
         mu = np.clip(mu_out, self.train_data_min, self.train_data_max)
 
-        #sigma = nn.activation.softplus(self.sigma_dense(out))  # 1D version
-        # avoid having tiny components that overly concentrate mass, and don't need components larger than data standard deviation
-        #sigma = np.clip(sigma, self.sigma_min, self.train_data_std) # previous version
+        ## this is the original version of the multichannel pixelCNN sigma matrix calculation, 
+        ## previous verion (unstable): constructing a learned sigma matrix
+        ## sigma items need to be reshaped to be a covariance matrix, and clipped to be a valid cholesky decomposition
+        # sigma_out = self.sigma_dense(out) 
+        # sigma_out = np.reshape(sigma_out, (out.shape[0], out.shape[1], out.shape[2], self.num_mixture_components, self.data_shape[2], self.data_shape[2])) # reshape from b x h x w x components*num_channels**2 to b x h x w x components x num_channels x num_channels
+        ## make a lower triangular matrix L for L L^T
+        # sigma_out = np.tril(sigma_out)
+        ## manually loop through channel components to clip diagonals
+        # for channel_idx in range(self.data_shape[2]):
+        #     # apply softplus to this diagonal
+        #     sigma_out = sigma_out.at[..., channel_idx, channel_idx].set(nn.softplus(sigma_out[..., channel_idx, channel_idx]))
+        #     # then clip the components, assuming minimal std = 1, which may not be true for all kinds of data
+        #     sigma_out = sigma_out.at[..., channel_idx, channel_idx].set(np.clip(sigma_out[..., channel_idx, channel_idx], self.sigma_min, self.train_data_std[channel_idx]))
+        ## construct covariance matrix from L L^T and add a small amount to diagonal to ensure positive definiteness
+        # sigma_out_transpose = np.einsum('...ij->...ji', sigma_out) 
+        # sigma = np.einsum('...ij, ...jk->...ik', sigma_out, sigma_out_transpose)
+        # sigma = sigma + 1e-6 * np.eye(self.data_shape[2])
 
-        # sigma items need to be reshaped to be a covariance matrix, and clipped to be a valid cholesky decomposition
-        sigma_out = self.sigma_dense(out) 
-        # reshape to covariance matrix dimensions
-        sigma_out = np.reshape(sigma_out, (out.shape[0], out.shape[1], out.shape[2], self.num_mixture_components, self.data_shape[2], self.data_shape[2])) # reshape from b x h x w x components*num_channels**2 to b x h x w x components x num_channels x num_channels
-        # make a lower triangular matrix L for L L^T
-        sigma_out = np.tril(sigma_out)
-        # manually loop through the channel components to clip the diagonals TODO could be more intelligently done maybe?
-        for channel_idx in range(self.data_shape[2]):
-            # apply softplus to this diagonal
-            sigma_out = sigma_out.at[..., channel_idx, channel_idx].set(nn.softplus(sigma_out[..., channel_idx, channel_idx]))
-            # then clip the components TODO need to change sigma_min to not be 1 in the future when it's not image data 
-            sigma_out = sigma_out.at[..., channel_idx, channel_idx].set(np.clip(sigma_out[..., channel_idx, channel_idx], self.sigma_min, self.train_data_std[channel_idx])) # TODO think about if there needs to be an absolute train_data_std
-        # now turn this into a covariance matrix
-        # transpose, swap the last two dimensions
-        sigma_out_transpose = np.einsum('...ij->...ji', sigma_out) 
-        # multiply cov = L L^T 
-        sigma = np.einsum('...ij, ...jk->...ik', sigma_out, sigma_out_transpose)
-        # add a small amount to the diagonal to make sure it's positive definite, 1e-6
-        sigma = sigma + 1e-6 * np.eye(self.data_shape[2])
-
+        # current version learns a Cholesky decomposition
+        cholesky_l = self.sigma_dense(out) 
+        # reshape to covariance matrix dimensions 
+        cholesky_l = np.reshape(cholesky_l, (out.shape[0], out.shape[1], out.shape[2], self.num_mixture_components, self.data_shape[2], self.data_shape[2])) # reshape from b x h x w x components*num_channels**2 to b x h x w x components x num_channels x num_channels
+        # make a lower triangular matrix L for L L^^T 
+        cholesky_l = np.tril(cholesky_l)
+        # clip the diagonals of this function to be positive. doing in a vectorized form this time: apply softplus, clip components
+        diagonals = cholesky_l[..., np.arange(self.data_shape[2]), np.arange(self.data_shape[2])]
+        diagonals = nn.softplus(diagonals) 
+        diagonals = np.clip(diagonals, self.sigma_min, self.train_data_std) 
+        cholesky_l = cholesky_l.at[..., np.arange(self.data_shape[2]), np.arange(self.data_shape[2])].set(diagonals) 
+        
         mix_logit = self.mix_logit_dense(out) # stays as b x h x w x n_components. there isn't a channel dimension for this one
 
-        return mu, sigma, mix_logit
-
+        return mu, cholesky_l, mix_logit
 
 
 class MultiChannelPixelCNN(MeasurementModel):
     """
-    The PixelCNN model for autoregressive image modeling.
+    The MultiChannelPixelCNN model for autoregressive multichannel image modeling.
 
-    This class handles the training and evaluation of the PixelCNN model and wraps the Flax implementation
+    This class handles the training and evaluation of the MultiChannelPixelCNN model and wraps the Flax implementation
     in a higher-level interface that conforms to the MeasurementModel class. It provides methods for fitting
     the model to data, computing the negative log-likelihood of images, and generating new images.
 
@@ -464,7 +489,7 @@ class MultiChannelPixelCNN(MeasurementModel):
 
     def __init__(self, num_hidden_channels=64, num_mixture_components=40):
         """
-        Initialize the PixelCNN model with image shape, number of hidden channels, and mixture components.
+        Initialize the MultiChannelPixelCNN model with image shape, number of hidden channels, and mixture components.
 
         Parameters
         ----------
@@ -485,7 +510,7 @@ class MultiChannelPixelCNN(MeasurementModel):
             # deprecated
             seed=None,):
         """
-        Train the PixelCNN model on a dataset of images.
+        Train the MultiChannelPixelCNN model on a dataset of images.
 
         Parameters
         ----------
@@ -537,9 +562,10 @@ class MultiChannelPixelCNN(MeasurementModel):
         model_key = jax.random.PRNGKey(onp.random.randint(0, 100000))
 
         if condition_vectors is not None:
-            warnings.warn("For multi-channel PixelCNN condition vectors have not been implemented or double checked.")
+            warnings.warn("For MultiChannelPixelCNN condition vectors have not been implemented or double checked.")
         
         self._validate_data(train_images)
+
 
         train_images = train_images.astype(np.float32)
 
@@ -560,7 +586,7 @@ class MultiChannelPixelCNN(MeasurementModel):
         _, dataset_fn = make_dataset_generators(train_images, batch_size=400, num_val_samples=train_images.shape[0],
                                                 add_gaussian_noise=add_gaussian_noise, add_uniform_noise=add_uniform_noise, 
                                                 seed=data_seed)
-        example_images = dataset_fn().next() # TODO can make this batch size bigger if needed just to get the settings for the values in the following model initialization, currently at 400
+        example_images = dataset_fn().next()
 
         if self._flax_model is None:
             self.add_gaussian_noise = add_gaussian_noise
@@ -633,7 +659,7 @@ class MultiChannelPixelCNN(MeasurementModel):
 
     def compute_negative_log_likelihood(self, data, conditioning_vecs=None,  data_seed=None, average=True, verbose=True, seed=None):
         """
-        Compute the negative log-likelihood (NLL) of images under the trained PixelCNN model.
+        Compute the negative log-likelihood (NLL) of images under the trained MultiChannelPixelCNN model.
 
         Parameters
         ----------
@@ -737,23 +763,25 @@ class MultiChannelPixelCNN(MeasurementModel):
 
                 key, key2 = jax.random.split(key)
                 if conditioning_vecs is None:
-                    mu, sigma, mix_logit = self._flax_model.apply(self._state.params, conditioning_images)
+                    mu, cholesky_l, mix_logit = self._flax_model.apply(self._state.params, conditioning_images)
                 else:
-                    mu, sigma, mix_logit = self._flax_model.apply(self._state.params, conditioning_images, conditioning_vecs)
+                    mu, cholesky_l, mix_logit = self._flax_model.apply(self._state.params, conditioning_images, conditioning_vecs)
                 # only sampling one pixel at a time
                 # make onp arrays for range checking
                 mu = onp.array(mu)[:, i_in_cropped_image, j_in_cropped_image, :]
-                sigma = onp.array(sigma)[:, i_in_cropped_image, j_in_cropped_image, :]
+                cholesky_l = onp.array(cholesky_l)[:, i_in_cropped_image, j_in_cropped_image, :]
                 mix_logit = onp.array(mix_logit)[:, i_in_cropped_image, j_in_cropped_image, :]
-
                 # mix_probs = np.exp(mix_logit - logsumexp(mix_logit, axis=-1, keepdims=True)) # this was commented out in 1D pixelcnn as well
                 component_indices = jax.random.categorical(key, mix_logit, axis=-1)
                 # draw categorical sample
                 sample_mus = mu[np.arange(num_samples), component_indices]
-                sample_sigmas = sigma[np.arange(num_samples), component_indices]
-                #sample = jax.random.normal(key2, shape=sample_mus.shape) * sample_sigmas + sample_mus # 1D pixelcnn version
-                # switching to a multivariate normal distribution for the sigmas
-                sample = jax.random.multivariate_normal(key2, sample_mus, sample_sigmas)
+                sample_L = cholesky_l[np.arange(num_samples), component_indices]
+                
+                L_transpose = np.einsum('...ij->...ji', sample_L)
+                sample_cov = np.einsum('...ij, ...jk->...ik', sample_L, L_transpose)
+                sample = jax.random.multivariate_normal(key2, sample_mus, sample_cov)
+                # alternative single line way of doing the same operation:
+                # sample_cov = np.einsum("nij,nkj->nik", sample_L, sample_L)
                 sampled_images[:, i, j] = sample
 
         if ensure_nonnegative:
